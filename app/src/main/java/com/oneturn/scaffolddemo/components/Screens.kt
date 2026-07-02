@@ -1,59 +1,78 @@
 package com.oneturn.scaffolddemo.components
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
 
-/**
- * 纯 UI 容器，不再自己管理手势状态
- * 
- * @param offsetX 当前页面的水平位移
- * @param content 页面内容
- */
 @Composable
 fun SwipeablePageWrapper(
     offsetX: Float,
+    screenWidthPx: Float,
     isBottomPage: Boolean = false,
-    content: @Composable () -> Unit
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
 ) {
     Box(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxSize()
             .graphicsLayer {
+                compositingStrategy = CompositingStrategy.ModulateAlpha
                 if (isBottomPage) {
-                    // 底层页面：模拟微信的视差效果
-                    translationX = -200f * (1f - offsetX / size.width)
-                    // 底层页面稍微暗一点
-                    alpha = 0.8f + 0.2f * (offsetX / size.width)
+                    val progress = if (screenWidthPx > 0f) {
+                        (offsetX / screenWidthPx).coerceIn(0f, 1f)
+                    } else {
+                        0f
+                    }
+                    // progress=0 时保持原位，避免老页面在盖住状态下被向左偏移
+                    translationX = if (progress > 0f) {
+                        -screenWidthPx * (1f - progress) * 0.3f
+                    } else {
+                        0f
+                    }
+                    alpha = if (progress > 0f) 0.8f + 0.2f * progress else 1f
                 } else {
-                    // 顶层页面：直接跟随位移
                     translationX = offsetX
                 }
             }
-            .background(MaterialTheme.colorScheme.background)
+            .background(MaterialTheme.colorScheme.background),
     ) {
         content()
-        
-        // 如果是顶层页面正在滑动，在它左边加一道阴影
-        if (!isBottomPage && offsetX > 0) {
+
+        if (!isBottomPage && offsetX > 0f) {
             Box(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .width(10.dp)
-                    .offset { IntOffset(-10.dp.roundToPx(), 0) }
+                    .width(8.dp)
+                    .offset { IntOffset(-8.dp.roundToPx(), 0) }
                     .background(
-                        brush = androidx.compose.ui.graphics.Brush.horizontalGradient(
-                            colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.1f))
-                        )
-                    )
+                        brush = Brush.horizontalGradient(
+                            colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.08f)),
+                        ),
+                    ),
             )
         }
     }
@@ -63,14 +82,14 @@ fun SwipeablePageWrapper(
 @Composable
 fun ScreenA(onNavigateToB: () -> Unit) {
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Screen A") }) }
+        topBar = { TopAppBar(title = { Text("Screen A") }) },
     ) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
             verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text("这是页面 A", style = MaterialTheme.typography.headlineMedium)
             Spacer(modifier = Modifier.height(16.dp))
@@ -85,18 +104,18 @@ fun ScreenA(onNavigateToB: () -> Unit) {
 @Composable
 fun ScreenB() {
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Screen B") }) }
+        topBar = { TopAppBar(title = { Text("Screen B") }) },
     ) { padding ->
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
-            contentAlignment = Alignment.Center
+            contentAlignment = Alignment.Center,
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("这是页面 B", style = MaterialTheme.typography.headlineMedium)
                 Spacer(modifier = Modifier.height(8.dp))
-                Text("从屏幕左侧边缘向右滑...", color = Color.Gray)
+                Text("从屏幕任意位置向右滑动返回", color = Color.Gray)
             }
         }
     }

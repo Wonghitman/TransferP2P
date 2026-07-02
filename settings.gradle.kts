@@ -22,6 +22,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ScaffoldDemo"
-include(":app")
- 
+rootProject.name = "TransferP2P"
+include(":shared")
+include(":composeApp")

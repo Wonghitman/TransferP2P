@@ -21,7 +21,7 @@ fun ChatScreen() {
         keepTopBarFixed = true, // 目前测试固定模式
         topBar = {
             TopAppBar(
-                title = { Text("聊天界面") },
+                title = { Text("聊天界面1") },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer
                 )
