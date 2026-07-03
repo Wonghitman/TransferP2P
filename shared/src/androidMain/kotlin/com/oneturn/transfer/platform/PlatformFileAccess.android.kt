@@ -1,6 +1,11 @@
 package com.oneturn.transfer.platform
 
+import android.content.ContentValues
+import android.media.MediaScannerConnection
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -9,6 +14,8 @@ import kotlinx.coroutines.CompletableDeferred
 import okio.sink
 import okio.source
 import java.io.File
+
+private const val PUBLIC_SUBDIR = "TransferP2P"
 
 actual class PlatformFilePicker(
     private val activity: ComponentActivity,
@@ -60,6 +67,7 @@ actual class PlatformFilePicker(
 }
 
 private lateinit var appContext: android.content.Context
+private val receiveFiles = mutableMapOf<String, File>()
 
 fun initPlatformContext(context: android.content.Context) {
     appContext = context.applicationContext
@@ -69,10 +77,136 @@ actual fun createReceiveSink(manifest: TransferManifest): okio.Sink {
     val dir = File(appContext.cacheDir, "received")
     dir.mkdirs()
     val safeName = manifest.fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-    val file = File(dir, safeName)
+    val file = File(dir, "${manifest.transferId}-$safeName")
+    receiveFiles[manifest.transferId] = file
     return file.sink()
 }
 
-actual class QrScanner {
-    actual suspend fun scanJoinUrl(): String? = null
+actual fun publishReceivedFile(manifest: TransferManifest): String {
+    val file = receiveFiles[manifest.transferId]
+        ?: return "保存失败: 找不到接收缓存"
+    if (!file.exists() || file.length() <= 0L) {
+        return "保存失败: 缓存文件为空"
+    }
+
+    val safeName = uniqueFileName(
+        manifest.fileName.replace(Regex("[\\\\/:*?\"<>|]"), "_"),
+    )
+    val mimeType = manifest.mimeType.ifBlank { guessMimeType(safeName) }
+
+    val published = runCatching { publishToPublicDownloads(file, safeName, mimeType) }
+        .getOrElse { "保存失败: ${it.message ?: "MediaStore 写入异常"}" }
+
+    if (!published.startsWith("保存失败")) {
+        receiveFiles.remove(manifest.transferId)
+        runCatching { file.delete() }
+        return published
+    }
+
+    val fallback = runCatching { publishToAppDownloads(file, safeName) }
+        .getOrElse { "保存失败: ${it.message ?: "备用目录写入异常"}" }
+    if (!fallback.startsWith("保存失败")) {
+        receiveFiles.remove(manifest.transferId)
+        runCatching { file.delete() }
+    }
+    return fallback
+}
+
+private fun publishToAppDownloads(file: File, safeName: String): String {
+    val dir = File(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "Received")
+    if (!dir.exists() && !dir.mkdirs()) {
+        return "保存失败: 无法创建应用下载目录"
+    }
+    val dest = File(dir, safeName)
+    file.copyTo(dest, overwrite = true)
+    MediaScannerConnection.scanFile(appContext, arrayOf(dest.absolutePath), null, null)
+    return "已保存到应用目录 Android/data/${appContext.packageName}/files/Download/Received/$safeName"
+}
+
+private fun uniqueFileName(original: String): String {
+    val dot = original.lastIndexOf('.')
+    val base = if (dot > 0) original.substring(0, dot) else original
+    val ext = if (dot > 0) original.substring(dot) else ""
+    val stamp = (System.currentTimeMillis() % 1_000_000).toString()
+    return "${base}_$stamp$ext"
+}
+
+private fun guessMimeType(fileName: String): String {
+    val ext = fileName.substringAfterLast('.', "").lowercase()
+    return when (ext) {
+        "jpg", "jpeg" -> "image/jpeg"
+        "png" -> "image/png"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "mp4" -> "video/mp4"
+        "pdf" -> "application/pdf"
+        "zip" -> "application/zip"
+        else -> "application/octet-stream"
+    }
+}
+
+private fun publishToPublicDownloads(file: File, displayName: String, mimeType: String): String {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        return publishToLegacyPublicDownloads(file, displayName)
+    }
+
+    val resolver = appContext.contentResolver
+    val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+    val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/$PUBLIC_SUBDIR/"
+
+    val values = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+        put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+        put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+        put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+
+    val uri = resolver.insert(collection, values)
+        ?: return "保存失败: 无法创建下载条目"
+
+    val written = try {
+        val output = resolver.openOutputStream(uri)
+        if (output == null) {
+            false
+        } else {
+            output.use { out ->
+                file.inputStream().use { input -> input.copyTo(out) }
+            }
+            true
+        }
+    } catch (_: Exception) {
+        false
+    }
+
+    if (!written) {
+        resolver.delete(uri, null, null)
+        return "保存失败: 写入下载目录失败"
+    }
+
+    values.clear()
+    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+    resolver.update(uri, values, null, null)
+
+    return buildString {
+        append("已保存到 Download/$PUBLIC_SUBDIR/$displayName")
+        append("（文件管理里可能显示为「下载」，请搜索文件名: $displayName）")
+    }
+}
+
+@Suppress("DEPRECATION")
+private fun publishToLegacyPublicDownloads(file: File, safeName: String): String {
+    if (!Environment.getExternalStorageState().equals(Environment.MEDIA_MOUNTED)) {
+        return "保存失败: 存储不可用"
+    }
+    val dir = File(
+        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+        PUBLIC_SUBDIR,
+    )
+    if (!dir.exists() && !dir.mkdirs()) {
+        return "保存失败: 无法创建 Download/$PUBLIC_SUBDIR"
+    }
+    val dest = File(dir, safeName)
+    file.copyTo(dest, overwrite = true)
+    MediaScannerConnection.scanFile(appContext, arrayOf(dest.absolutePath), null, null)
+    return "已保存到 Download/$PUBLIC_SUBDIR/$safeName"
 }

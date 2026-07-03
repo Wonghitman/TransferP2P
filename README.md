@@ -19,7 +19,7 @@
 
 - 文件走 WebRTC DataChannel（DTLS 端到端加密）
 - 信令仅交换 SDP/ICE（Cloudflare Durable Object WebSocket）
-- STUN: `stun.cloudflare.com`；可选 Cloudflare TURN 兜底
+- STUN: `stun.cloudflare.com`（仅 P2P 直连，两台设备需同一 WiFi）
 - 临时配对：房间码 + PAKE 校验
 - 持久设备：配对码登记信任设备
 

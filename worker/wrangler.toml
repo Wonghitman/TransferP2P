@@ -1,9 +1,9 @@
-name = "transfer-p2p"
+name = "sendmaster"
 main = "src/index.ts"
 compatibility_date = "2026-01-01"
 
 [vars]
-PUBLIC_BASE_URL = "https://transfer-p2p.YOUR_SUBDOMAIN.workers.dev"
+PUBLIC_BASE_URL = "https://sendmaster.saimai.workers.dev"
 ROOM_TTL_SECONDS = "3600"
 
 [[durable_objects.bindings]]

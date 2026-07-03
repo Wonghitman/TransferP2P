@@ -14,6 +14,7 @@ class PairingService(
     suspend fun createSenderRoom(): RoomInfo {
         val response = signaling.createRoom()
         signaling.connect(response.wsUrl, SignalingRole.Sender)
+        signaling.waitUntilConnected()
         return RoomInfo(
             code = response.code,
             joinUrl = response.joinUrl,
@@ -25,6 +26,7 @@ class PairingService(
     suspend fun joinReceiverRoom(code: String): RoomInfo {
         val response = signaling.joinRoom(code)
         signaling.connect(response.wsUrl, SignalingRole.Receiver)
+        signaling.waitUntilConnected()
         return RoomInfo(
             code = response.code,
             joinUrl = "",

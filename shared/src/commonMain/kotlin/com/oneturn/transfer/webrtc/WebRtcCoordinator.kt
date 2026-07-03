@@ -9,15 +9,19 @@ import com.shepeliev.webrtckmp.SessionDescription
 import com.shepeliev.webrtckmp.SessionDescriptionType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 class WebRtcCoordinator(
     private val scope: CoroutineScope,
     private val signaling: SignalingClient,
     private val role: SignalingRole,
     private val iceServers: List<IceServerConfig>,
+    private val onStatus: (String) -> Unit = {},
 ) {
     private var session: WebRtcSession? = null
     private var jobs = mutableListOf<Job>()
@@ -32,10 +36,11 @@ class WebRtcCoordinator(
 
         jobs += scope.launch {
             webRtcSession.localIceCandidates.collect { candidate ->
+                val adjusted = boostIpv6CandidatePriority(candidate.candidate)
                 signaling.send(
                     SignalingMessage.IceCandidate(
                         from = signaling.peerId,
-                        candidate = candidate.candidate,
+                        candidate = adjusted,
                         sdpMid = candidate.sdpMid,
                         sdpMLineIndex = candidate.sdpMLineIndex,
                     ),
@@ -48,14 +53,15 @@ class WebRtcCoordinator(
                 if (message.from == signaling.peerId) return@collect
                 webRtcSession.addRemoteIceCandidate(
                     IceCandidate(
-                        candidate = message.candidate,
                         sdpMid = message.sdpMid.orEmpty(),
                         sdpMLineIndex = message.sdpMLineIndex ?: 0,
+                        candidate = message.candidate,
                     ),
                 )
             }
         }
 
+        onStatus("交换 SDP...")
         if (peerRole == PeerRole.Initiator) {
             val offer = webRtcSession.createOffer()
             signaling.send(
@@ -64,16 +70,20 @@ class WebRtcCoordinator(
                     sdp = offer.sdp,
                 ),
             )
-            val answerMessage = signaling.incoming
-                .filterIsInstance<SignalingMessage.Answer>()
-                .first { it.from != signaling.peerId }
+            val answerMessage = withTimeout(SDP_TIMEOUT_MS) {
+                signaling.incoming
+                    .filterIsInstance<SignalingMessage.Answer>()
+                    .first { it.from != signaling.peerId }
+            }
             webRtcSession.setRemoteAnswer(
                 SessionDescription(SessionDescriptionType.Answer, answerMessage.sdp),
             )
         } else {
-            val offerMessage = signaling.incoming
-                .filterIsInstance<SignalingMessage.Offer>()
-                .first { it.from != signaling.peerId }
+            val offerMessage = withTimeout(SDP_TIMEOUT_MS) {
+                signaling.incoming
+                    .filterIsInstance<SignalingMessage.Offer>()
+                    .first { it.from != signaling.peerId }
+            }
             val answer = webRtcSession.createAnswer(
                 SessionDescription(SessionDescriptionType.Offer, offerMessage.sdp),
             )
@@ -85,6 +95,7 @@ class WebRtcCoordinator(
             )
         }
 
+        onStatus("等待 P2P 通道就绪...")
         webRtcSession.waitForDataChannelOpen()
     }
 
@@ -96,8 +107,11 @@ class WebRtcCoordinator(
     }
 
     companion object {
+        private const val SDP_TIMEOUT_MS = 45_000L
+
         fun defaultIceServers(turn: List<IceServerDto> = emptyList()): List<IceServerConfig> =
             buildList {
+                add(IceServerConfig(urls = listOf("stun:stun.l.google.com:19302")))
                 add(IceServerConfig(urls = listOf("stun:stun.cloudflare.com:3478")))
                 addAll(turn.map { it.toConfig() })
             }

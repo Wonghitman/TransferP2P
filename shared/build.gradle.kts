@@ -35,6 +35,8 @@ kotlin {
             implementation(libs.kotlinx.coroutines.android)
             implementation(libs.androidx.activity.compose)
             implementation(libs.androidx.core.ktx)
+            implementation(libs.zxing.android.embedded)
+            implementation("com.squareup.okhttp3:okhttp:4.12.0")
         }
     }
 }

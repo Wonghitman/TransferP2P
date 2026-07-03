@@ -73,6 +73,12 @@ sealed class SignalingMessage {
 }
 
 @Serializable
+data class HealthResponse(
+    val ok: Boolean,
+    val service: String? = null,
+)
+
+@Serializable
 data class CreateRoomResponse(
     val code: String,
     val joinUrl: String,
@@ -88,7 +94,7 @@ data class JoinRoomResponse(
 )
 
 @Serializable
-data class TurnCredentialsResponse(
+data class IceServersResponse(
     val iceServers: List<IceServerDto>,
     val ttl: Int,
 )
@@ -127,4 +133,66 @@ data class TrustedDeviceDto(
     val deviceId: String,
     val publicKey: String,
     val displayName: String,
+    val online: Boolean = false,
+)
+
+@Serializable
+data class OnlineStatusRequest(
+    val deviceIds: List<String>,
+)
+
+@Serializable
+data class OnlineStatusResponse(
+    val online: Map<String, Boolean>,
+)
+
+@Serializable
+data class InviteDeviceRequest(
+    val fromDeviceId: String,
+    val toDeviceId: String,
+    val fromDisplayName: String,
+)
+
+@Serializable
+data class InviteDeviceResponse(
+    val code: String,
+    val joinUrl: String,
+    val wsUrl: String,
+    val expiresAt: Long,
+    val inviteId: String,
+    val toDeviceId: String,
+)
+
+@Serializable
+data class TransferInviteDto(
+    val inviteId: String,
+    val code: String,
+    val wsUrl: String,
+    val fromDeviceId: String,
+    val fromDisplayName: String,
+    val toDeviceId: String,
+    val expiresAt: Long,
+)
+
+@Serializable
+data class ConsumeInviteRequest(
+    val toDeviceId: String,
+)
+
+@Serializable
+data class InviteNotification(
+    val type: String,
+    val inviteId: String = "",
+    val code: String = "",
+    val wsUrl: String = "",
+    val fromDeviceId: String = "",
+    val fromDisplayName: String = "",
+    val expiresAt: Long = 0,
+)
+
+@Serializable
+data class PresenceUpdateNotification(
+    val type: String,
+    val deviceId: String,
+    val online: Boolean,
 )

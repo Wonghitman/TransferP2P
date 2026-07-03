@@ -79,4 +79,5 @@ data class TrustedDevice(
     val deviceId: String,
     val publicKey: String,
     val displayName: String,
+    val online: Boolean = false,
 )

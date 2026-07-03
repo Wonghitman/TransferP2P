@@ -1,19 +1,12 @@
 package com.oneturn.transfer.signaling
 
+import com.oneturn.transfer.platform.createSignalingHttp
+import com.oneturn.transfer.platform.SignalingHttp
+import com.oneturn.transfer.platform.createHttpClient
 import io.ktor.client.HttpClient
-import io.ktor.client.call.body
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.plugins.websocket.WebSockets
-import io.ktor.client.plugins.websocket.webSocket
-import io.ktor.client.request.get
-import io.ktor.client.request.post
-import io.ktor.client.request.setBody
-import io.ktor.http.ContentType
-import io.ktor.http.contentType
-import io.ktor.serialization.kotlinx.json.json
-import io.ktor.websocket.Frame
-import io.ktor.websocket.readText
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.BufferOverflow
@@ -24,13 +17,17 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlin.random.Random
 
 class SignalingClient(
     private val baseUrl: String,
+    private val platformHttp: SignalingHttp = createSignalingHttp(),
     private val httpClient: HttpClient = createHttpClient(),
     private val scope: CoroutineScope,
 ) {
@@ -46,6 +43,7 @@ class SignalingClient(
     val connectionState: StateFlow<SignalingConnectionState> = _connectionState.asStateFlow()
 
     private val _incoming = MutableSharedFlow<SignalingMessage>(
+        replay = 32,
         extraBufferCapacity = 64,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
@@ -54,83 +52,95 @@ class SignalingClient(
     private val outbound = Channel<String>(Channel.BUFFERED)
     private var sessionJob: Job? = null
 
-    suspend fun createRoom(): CreateRoomResponse =
-        httpClient.post("$baseUrl/rooms") {
-            contentType(ContentType.Application.Json)
-        }.body()
+    suspend fun checkHealth(): Boolean = withNetworkRetry {
+        json.decodeFromString(
+            HealthResponse.serializer(),
+            platformHttp.get("$baseUrl/"),
+        ).ok
+    }
 
-    suspend fun joinRoom(code: String): JoinRoomResponse =
-        httpClient.get("$baseUrl/rooms/$code").body()
+    suspend fun createRoom(): CreateRoomResponse = withNetworkRetry {
+        json.decodeFromString(
+            CreateRoomResponse.serializer(),
+            platformHttp.post("$baseUrl/rooms"),
+        )
+    }
 
-    suspend fun fetchTurnCredentials(): TurnCredentialsResponse =
-        httpClient.post("$baseUrl/turn-credentials") {
-            contentType(ContentType.Application.Json)
-        }.body()
+    suspend fun joinRoom(code: String): JoinRoomResponse = withNetworkRetry {
+        json.decodeFromString(
+            JoinRoomResponse.serializer(),
+            platformHttp.get("$baseUrl/rooms/$code"),
+        )
+    }
+
+    suspend fun fetchIceServers(): IceServersResponse = withNetworkRetry {
+        json.decodeFromString(
+            IceServersResponse.serializer(),
+            platformHttp.post("$baseUrl/ice-servers"),
+        )
+    }
 
     suspend fun registerDevice(request: RegisterDeviceRequest): RegisterDeviceResponse =
-        httpClient.post("$baseUrl/devices/register") {
-            contentType(ContentType.Application.Json)
-            setBody(request)
-        }.body()
+        withNetworkRetry {
+            json.decodeFromString(
+                RegisterDeviceResponse.serializer(),
+                platformHttp.post(
+                    "$baseUrl/devices/register",
+                    json.encodeToString(RegisterDeviceRequest.serializer(), request),
+                ),
+            )
+        }
 
-    suspend fun claimDevice(request: ClaimDeviceRequest): TrustedDeviceDto =
-        httpClient.post("$baseUrl/devices/claim") {
-            contentType(ContentType.Application.Json)
-            setBody(request)
-        }.body()
+    suspend fun claimDevice(request: ClaimDeviceRequest): TrustedDeviceDto = withNetworkRetry {
+        json.decodeFromString(
+            TrustedDeviceDto.serializer(),
+            platformHttp.post(
+                "$baseUrl/devices/claim",
+                json.encodeToString(ClaimDeviceRequest.serializer(), request),
+            ),
+        )
+    }
 
-    suspend fun listTrustedDevices(deviceId: String): List<TrustedDeviceDto> =
-        httpClient.get("$baseUrl/devices/$deviceId/trusted").body()
+    suspend fun listTrustedDevices(deviceId: String): List<TrustedDeviceDto> = withNetworkRetry {
+        json.decodeFromString(
+            ListSerializer(TrustedDeviceDto.serializer()),
+            platformHttp.get("$baseUrl/devices/$deviceId/trusted"),
+        )
+    }
+
+    suspend fun fetchOnlineStatus(deviceIds: List<String>): Map<String, Boolean> = withNetworkRetry {
+        if (deviceIds.isEmpty()) return@withNetworkRetry emptyMap()
+        json.decodeFromString(
+            OnlineStatusResponse.serializer(),
+            platformHttp.post(
+                "$baseUrl/devices/online-status",
+                json.encodeToString(OnlineStatusRequest.serializer(), OnlineStatusRequest(deviceIds)),
+            ),
+        ).online
+    }
+
+    suspend fun inviteTrustedDevice(request: InviteDeviceRequest): InviteDeviceResponse =
+        withNetworkRetry {
+            json.decodeFromString(
+                InviteDeviceResponse.serializer(),
+                platformHttp.post(
+                    "$baseUrl/devices/invite",
+                    json.encodeToString(InviteDeviceRequest.serializer(), request),
+                ),
+            )
+        }
 
     fun connect(wsUrl: String, role: SignalingRole, deviceId: String? = null) {
         disconnect()
+        _incoming.resetReplayCache()
         sessionJob = scope.launch {
-            var attempt = 0
-            while (isActive) {
-                try {
-                    _connectionState.value = SignalingConnectionState.Connecting
-                    httpClient.webSocket(wsUrl) {
-                        _connectionState.value = SignalingConnectionState.Connected
-                        attempt = 0
+            launchWebSocketSession(wsUrl, role, deviceId, this)
+        }
+    }
 
-                        val joinPayload = json.encodeToString(
-                            SignalingMessage.serializer(),
-                            SignalingMessage.Join(role, peerId, deviceId),
-                        )
-                        send(Frame.Text(joinPayload))
-
-                        val sender = launch {
-                            for (message in outbound) {
-                                send(Frame.Text(message))
-                            }
-                        }
-
-                        try {
-                            for (frame in incoming) {
-                                if (frame is Frame.Text) {
-                                    val message = json.decodeFromString(
-                                        SignalingMessage.serializer(),
-                                        frame.readText(),
-                                    )
-                                    _incoming.emit(message)
-                                }
-                            }
-                        } finally {
-                            sender.cancel()
-                        }
-                    }
-                } catch (_: Throwable) {
-                    if (!isActive) break
-                    _connectionState.value = SignalingConnectionState.Reconnecting
-                    delay(1_000L * (attempt.coerceAtMost(5) + 1))
-                    attempt++
-                    continue
-                }
-                if (!isActive) break
-                _connectionState.value = SignalingConnectionState.Reconnecting
-                delay(1_000L)
-            }
-            _connectionState.value = SignalingConnectionState.Disconnected
+    suspend fun waitUntilConnected(timeoutMs: Long = 30_000) {
+        withTimeout(timeoutMs) {
+            connectionState.first { it == SignalingConnectionState.Connected }
         }
     }
 
@@ -145,7 +155,33 @@ class SignalingClient(
         while (outbound.tryReceive().isSuccess) {
             // drain pending messages
         }
+        _incoming.resetReplayCache()
         _connectionState.value = SignalingConnectionState.Disconnected
+    }
+
+    internal fun setConnectionState(state: SignalingConnectionState) {
+        _connectionState.value = state
+    }
+
+    internal fun encodeJoinMessage(role: SignalingRole, deviceId: String?): String =
+        json.encodeToString(
+            SignalingMessage.serializer(),
+            SignalingMessage.Join(role, peerId, deviceId),
+        )
+
+    internal suspend fun decodeIncomingMessage(text: String): SignalingMessage? =
+        runCatching {
+            json.decodeFromString(SignalingMessage.serializer(), text)
+        }.getOrNull()
+
+    internal suspend fun emitIncoming(message: SignalingMessage) {
+        _incoming.emit(message)
+    }
+
+    internal suspend fun drainOutbound(send: (String) -> Boolean) {
+        for (message in outbound) {
+            if (!send(message)) break
+        }
     }
 
     private fun generatePeerId(): String =
@@ -154,19 +190,25 @@ class SignalingClient(
             repeat(8) { append(Random.nextInt(16).toString(16)) }
         }
 
-    companion object {
-        fun createHttpClient(): HttpClient = HttpClient {
-            install(WebSockets)
-            install(ContentNegotiation) {
-                json(
-                    Json {
-                        ignoreUnknownKeys = true
-                        encodeDefaults = true
-                        classDiscriminator = "type"
-                    },
-                )
+    private suspend fun <T> withNetworkRetry(
+        attempts: Int = 3,
+        block: suspend () -> T,
+    ): T = withContext(Dispatchers.IO) {
+        var lastError: Throwable? = null
+        repeat(attempts) { attempt ->
+            try {
+                return@withContext block()
+            } catch (error: Throwable) {
+                lastError = error
+                if (error is SignalingHttpException && error.statusCode in 400..499) {
+                    throw error
+                }
+                if (attempt < attempts - 1) {
+                    delay(1_500L * (attempt + 1))
+                }
             }
         }
+        throw lastError ?: IllegalStateException("网络请求失败")
     }
 }
 

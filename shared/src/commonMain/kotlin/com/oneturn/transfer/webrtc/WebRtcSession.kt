@@ -15,18 +15,25 @@ import com.shepeliev.webrtckmp.onDataChannel
 import com.shepeliev.webrtckmp.onIceCandidate
 import com.shepeliev.webrtckmp.onIceConnectionStateChange
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.filter
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 private const val DATA_CHANNEL_LABEL = "transfer"
-private const val BACKPRESSURE_THRESHOLD = 64 * 1024L
+private const val BACKPRESSURE_THRESHOLD = 1024 * 1024L
+private const val BACKPRESSURE_LOW_THRESHOLD = 256 * 1024L
+private const val DATA_CHANNEL_OPEN_TIMEOUT_MS = 60_000L
+private const val MSG_TEXT: Byte = 1
+private const val MSG_BINARY: Byte = 2
+private const val MSG_ACK: Byte = 3
 
 class WebRtcSession(
     private val scope: CoroutineScope,
@@ -36,14 +43,14 @@ class WebRtcSession(
     private val _connectionMode = MutableStateFlow(ConnectionMode.Connecting)
     val connectionMode: StateFlow<ConnectionMode> = _connectionMode.asStateFlow()
 
+    private val _addressFamily = MutableStateFlow(PeerAddressFamily.Unknown)
+    val addressFamily: StateFlow<PeerAddressFamily> = _addressFamily.asStateFlow()
+
     private val _dataChannelState = MutableStateFlow(DataChannelState.Connecting)
     val dataChannelState: StateFlow<DataChannelState> = _dataChannelState.asStateFlow()
 
-    private val _incomingBinary = MutableSharedFlow<ByteArray>(extraBufferCapacity = 128)
-    val incomingBinary: SharedFlow<ByteArray> = _incomingBinary.asSharedFlow()
-
-    private val _incomingText = MutableSharedFlow<String>(extraBufferCapacity = 32)
-    val incomingText: SharedFlow<String> = _incomingText.asSharedFlow()
+    private val incomingChannel = Channel<DataChannelMessage>(Channel.UNLIMITED)
+    val incomingMessages = incomingChannel.receiveAsFlow()
 
     private val _localIceCandidates = MutableSharedFlow<IceCandidate>(extraBufferCapacity = 32)
     val localIceCandidates: SharedFlow<IceCandidate> = _localIceCandidates.asSharedFlow()
@@ -58,6 +65,8 @@ class WebRtcSession(
     )
 
     private var dataChannel: DataChannel? = null
+    private var remoteDescriptionApplied = false
+    private val pendingRemoteIce = mutableListOf<IceCandidate>()
 
     init {
         scope.launch {
@@ -73,15 +82,18 @@ class WebRtcSession(
         }
         scope.launch {
             peerConnection.onIceConnectionStateChange.collect { state ->
-                _connectionMode.value = when (state) {
+                when (state) {
                     com.shepeliev.webrtckmp.IceConnectionState.Connected,
                     com.shepeliev.webrtckmp.IceConnectionState.Completed,
-                    -> ConnectionMode.Direct
+                    -> {
+                        _connectionMode.value = ConnectionMode.Direct
+                        scope.launch { refreshAddressFamily() }
+                    }
                     com.shepeliev.webrtckmp.IceConnectionState.Failed ->
-                        ConnectionMode.Failed
+                        _connectionMode.value = ConnectionMode.Failed
                     com.shepeliev.webrtckmp.IceConnectionState.Closed ->
-                        ConnectionMode.Closed
-                    else -> ConnectionMode.Connecting
+                        _connectionMode.value = ConnectionMode.Closed
+                    else -> _connectionMode.value = ConnectionMode.Connecting
                 }
             }
         }
@@ -90,15 +102,17 @@ class WebRtcSession(
                 _localIceCandidates.emit(candidate)
             }
         }
-        scope.launch {
-            peerConnection.onDataChannel.collect { channel ->
-                bindDataChannel(channel)
+        if (role == PeerRole.Responder) {
+            scope.launch {
+                peerConnection.onDataChannel.collect { channel ->
+                    bindDataChannel(channel)
+                }
             }
-        }
-        if (role == PeerRole.Initiator) {
+        } else {
             val channel = peerConnection.createDataChannel(
                 label = DATA_CHANNEL_LABEL,
                 ordered = true,
+                // reliable (default): do not set maxRetransmits / maxPacketLifeTime
             )
             if (channel != null) {
                 bindDataChannel(channel)
@@ -114,6 +128,7 @@ class WebRtcSession(
 
     suspend fun createAnswer(remoteOffer: SessionDescription): SessionDescription {
         peerConnection.setRemoteDescription(remoteOffer)
+        flushPendingIceCandidates()
         val answer = peerConnection.createAnswer(OfferAnswerOptions())
         peerConnection.setLocalDescription(answer)
         return answer
@@ -121,39 +136,160 @@ class WebRtcSession(
 
     suspend fun setRemoteAnswer(answer: SessionDescription) {
         peerConnection.setRemoteDescription(answer)
+        flushPendingIceCandidates()
     }
 
     suspend fun addRemoteIceCandidate(candidate: IceCandidate) {
+        if (!remoteDescriptionApplied) {
+            pendingRemoteIce.add(candidate)
+            return
+        }
         peerConnection.addIceCandidate(candidate)
     }
 
-    suspend fun waitForDataChannelOpen() {
-        dataChannelState.filter { it == DataChannelState.Open }.first()
+    suspend fun waitForDataChannelOpen(timeoutMs: Long = DATA_CHANNEL_OPEN_TIMEOUT_MS) {
+        syncDataChannelState()
+        if (_dataChannelState.value == DataChannelState.Open) return
+
+        withTimeout(timeoutMs) {
+            while (_dataChannelState.value != DataChannelState.Open) {
+                if (_connectionMode.value == ConnectionMode.Failed) {
+                    error("P2P 打洞失败。请两台设备连接同一 WiFi")
+                }
+                if (_connectionMode.value == ConnectionMode.Closed) {
+                    error("P2P 连接已关闭")
+                }
+                syncDataChannelState()
+                if (_dataChannelState.value == DataChannelState.Open) return@withTimeout
+                delay(100)
+            }
+        }
+    }
+
+    private fun syncDataChannelState() {
+        val channel = dataChannel ?: return
+        val state = channel.readyState
+        if (state != _dataChannelState.value) {
+            _dataChannelState.value = state
+        }
+    }
+
+    private suspend fun flushPendingIceCandidates() {
+        remoteDescriptionApplied = true
+        val pending = pendingRemoteIce.toList()
+        pendingRemoteIce.clear()
+        pending.forEach { peerConnection.addIceCandidate(it) }
     }
 
     fun sendBinary(bytes: ByteArray) {
-        dataChannel?.send(bytes)
+        dataChannel?.send(byteArrayOf(MSG_BINARY) + bytes)
     }
 
     fun sendText(text: String) {
-        dataChannel?.send(text.encodeToByteArray())
+        val body = text.encodeToByteArray()
+        dataChannel?.send(byteArrayOf(MSG_TEXT) + body)
+    }
+
+    suspend fun awaitSendCapacity(additionalBytes: Long = 0L) {
+        awaitBackpressure(additionalBytes)
+    }
+
+    fun sendAck(ackedBytes: Long): Boolean {
+        val frame = ByteArray(9)
+        frame[0] = MSG_ACK
+        for (i in 0 until 8) {
+            frame[i + 1] = ((ackedBytes shr (i * 8)) and 0xFF).toByte()
+        }
+        val channel = dataChannel ?: return false
+        return channel.send(frame)
+    }
+
+    suspend fun sendBinaryReliable(bytes: ByteArray, drainAfterSend: Boolean = false) {
+        val frame = byteArrayOf(MSG_BINARY) + bytes
+        withTimeout(120_000) {
+            while (true) {
+                val channel = dataChannel ?: error("DataChannel 未就绪")
+                awaitBackpressure(frame.size.toLong())
+                if (channel.send(frame)) {
+                    if (drainAfterSend) {
+                        awaitDrain()
+                    } else {
+                        awaitBackpressure(0)
+                    }
+                    return@withTimeout
+                }
+                delay(10)
+            }
+        }
+    }
+
+    suspend fun sendTextReliable(text: String, drainAfterSend: Boolean = false) {
+        val frame = byteArrayOf(MSG_TEXT) + text.encodeToByteArray()
+        withTimeout(120_000) {
+            while (true) {
+                val channel = dataChannel ?: error("DataChannel 未就绪")
+                awaitBackpressure(frame.size.toLong())
+                if (channel.send(frame)) {
+                    if (drainAfterSend) {
+                        awaitDrain()
+                    } else {
+                        awaitBackpressure(0)
+                    }
+                    return@withTimeout
+                }
+                delay(10)
+            }
+        }
+    }
+
+    suspend fun awaitDrain(timeoutMs: Long = 120_000L) {
+        withTimeout(timeoutMs) {
+            while ((dataChannel?.bufferedAmount ?: 0L) > 0L) {
+                delay(10)
+            }
+        }
+    }
+
+    private suspend fun awaitBackpressure(additionalBytes: Long = 0L) {
+        while ((dataChannel?.bufferedAmount ?: 0L) + additionalBytes > BACKPRESSURE_THRESHOLD) {
+            delay(5)
+        }
     }
 
     val bufferedAmount: Long
         get() = dataChannel?.bufferedAmount ?: 0L
 
     val bufferedAmountLowThreshold: Long
-        get() = BACKPRESSURE_THRESHOLD
+        get() = BACKPRESSURE_LOW_THRESHOLD
 
     fun close() {
         dataChannel?.close()
         peerConnection.close()
         _connectionMode.value = ConnectionMode.Closed
+        _addressFamily.value = PeerAddressFamily.Unknown
+    }
+
+    private suspend fun refreshAddressFamily() {
+        repeat(12) {
+            val family = IceStatsResolver.detectAddressFamily(peerConnection)
+            if (family != PeerAddressFamily.Unknown) {
+                _addressFamily.value = family
+                if (family == PeerAddressFamily.Relay) {
+                    _connectionMode.value = ConnectionMode.Relay
+                }
+                return
+            }
+            delay(250)
+        }
+    }
+
+    suspend fun refreshAddressFamilyNow() {
+        refreshAddressFamily()
     }
 
     private fun bindDataChannel(channel: DataChannel) {
         dataChannel = channel
-        _dataChannelState.value = channel.readyState
+        syncDataChannelState()
         scope.launch {
             channel.onOpen.collect {
                 _dataChannelState.value = DataChannelState.Open
@@ -166,15 +302,54 @@ class WebRtcSession(
         }
         scope.launch {
             channel.onMessage.collect { payload ->
-                val bytes = payload as? ByteArray ?: return@collect
+                routeIncomingPayload(payload)
+            }
+        }
+        if (channel.readyState == DataChannelState.Open) {
+            _dataChannelState.value = DataChannelState.Open
+        }
+    }
+
+    private suspend fun routeIncomingPayload(payload: Any?) {
+        val bytes = payloadToBytes(payload) ?: return
+        if (bytes.isEmpty()) return
+
+        when (bytes[0]) {
+            MSG_TEXT -> {
+                val text = bytes.decodeToString(1, bytes.size, throwOnInvalidSequence = false)
+                if (text.isNotBlank()) {
+                    incomingChannel.send(DataChannelMessage.Text(text))
+                }
+            }
+            MSG_BINARY -> {
+                if (bytes.size > 1) {
+                    incomingChannel.send(DataChannelMessage.Binary(bytes.copyOfRange(1, bytes.size)))
+                }
+            }
+            MSG_ACK -> {
+                if (bytes.size >= 9) {
+                    var acked = 0L
+                    for (i in 0 until 8) {
+                        acked = acked or ((bytes[i + 1].toLong() and 0xFF) shl (i * 8))
+                    }
+                    incomingChannel.send(DataChannelMessage.ChunkAck(acked))
+                }
+            }
+            else -> {
                 val asText = runCatching { bytes.decodeToString() }.getOrNull()
                 if (asText != null && asText.startsWith("{")) {
-                    _incomingText.emit(asText)
+                    incomingChannel.send(DataChannelMessage.Text(asText))
                 } else {
-                    _incomingBinary.emit(bytes)
+                    incomingChannel.send(DataChannelMessage.Binary(bytes))
                 }
             }
         }
+    }
+
+    private fun payloadToBytes(payload: Any?): ByteArray? = when (payload) {
+        is ByteArray -> payload
+        is String -> payload.encodeToByteArray()
+        else -> null
     }
 
     private fun buildIceServers(servers: List<IceServerConfig>): List<IceServer> =

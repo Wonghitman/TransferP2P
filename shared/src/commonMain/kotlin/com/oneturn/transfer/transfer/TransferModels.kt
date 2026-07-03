@@ -4,6 +4,7 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class TransferManifest(
+    val type: String = "start",
     val transferId: String,
     val fileName: String,
     val mimeType: String,
@@ -20,9 +21,18 @@ data class TransferAck(
 )
 
 @Serializable
+data class BlockRequest(
+    val type: String = "request",
+    val transferId: String,
+    val chunkIndex: Int,
+)
+
+@Serializable
 data class TransferComplete(
+    val type: String = "end",
     val transferId: String,
     val sha256: String,
+    val sizeBytes: Long = 0,
 )
 
 @Serializable

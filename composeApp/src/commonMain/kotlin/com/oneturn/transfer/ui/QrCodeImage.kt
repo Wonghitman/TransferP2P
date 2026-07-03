@@ -17,7 +17,7 @@ fun QrCodeImage(
     darkColor: Color = Color.Black,
     lightColor: Color = Color.White,
 ) {
-    Canvas(modifier = modifier.size((matrix.width * 8).dp, (matrix.height * 8).dp)) {
+    Canvas(modifier = modifier.size(200.dp)) {
         val cellSize = size.width / matrix.width
         for (y in 0 until matrix.height) {
             for (x in 0 until matrix.width) {

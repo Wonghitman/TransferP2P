@@ -19,7 +19,20 @@ enum class ConnectionMode {
     Closed,
 }
 
+enum class PeerAddressFamily {
+    Unknown,
+    IPv4,
+    IPv6,
+    Relay,
+}
+
 enum class PeerRole {
     Initiator,
     Responder,
+}
+
+sealed interface DataChannelMessage {
+    data class Text(val text: String) : DataChannelMessage
+    data class Binary(val bytes: ByteArray) : DataChannelMessage
+    data class ChunkAck(val ackedBytes: Long) : DataChannelMessage
 }

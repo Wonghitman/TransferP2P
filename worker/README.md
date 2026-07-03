@@ -1,6 +1,6 @@
 # Transfer P2P Worker
 
-Cloudflare Worker for signaling and TURN credential issuance.
+Cloudflare Worker for signaling and STUN ICE server discovery.
 
 ## 部署方式（二选一）
 
@@ -22,9 +22,6 @@ Cloudflare Worker for signaling and TURN credential issuance.
 5. Worker 名称必须与 `wrangler.toml` 里的 `name = "transfer-p2p"` 一致
 6. 首次部署成功后，到 **Settings → Variables** 更新：
    - `PUBLIC_BASE_URL` = `https://transfer-p2p.<你的子域>.workers.dev`
-7. （可选）TURN 中继：Settings → Secrets 添加
-   - `TURN_KEY_ID`
-   - `TURN_KEY_API_TOKEN`
 
 之后每次 push 到 `master` 且 `worker/` 有改动，Cloudflare 会自动部署。
 
@@ -62,7 +59,7 @@ npx wrangler deploy
 - `POST /rooms` — 创建信令房间
 - `GET /rooms/:code` — 加入房间元数据
 - `GET /rooms/:code/ws` — WebSocket 信令
-- `POST /turn-credentials` — ICE/TURN 凭据
+- `POST /ice-servers` — STUN ICE 服务器列表
 - `POST /devices/register` / `claim` — 持久设备配对
 
 ## 本地开发

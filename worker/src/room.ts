@@ -11,12 +11,32 @@ interface DeviceRegistration {
   expiresAt: number;
 }
 
+interface TransferInvite {
+  inviteId: string;
+  code: string;
+  wsUrl: string;
+  fromDeviceId: string;
+  fromDisplayName: string;
+  toDeviceId: string;
+  expiresAt: number;
+}
+
+const PAIRING_PREFIX = "pairing:";
+const TRUSTED_PREFIX = "trusted:";
+const INVITE_PREFIX = "invite:";
+const PROFILE_PREFIX = "profile:";
+
+interface DeviceProfile {
+  deviceId: string;
+  publicKey: string;
+  displayName: string;
+}
+
 export class RoomDurableObject implements DurableObject {
   private peers = new Map<string, PeerSession>();
+  private presenceSockets = new Map<string, WebSocket>();
   private roomCode = "";
   private expiresAt = 0;
-  private registrations = new Map<string, DeviceRegistration>();
-  private trusted = new Map<string, Set<string>>();
 
   constructor(private state: DurableObjectState) {}
 
@@ -44,7 +64,14 @@ export class RoomDurableObject implements DurableObject {
 
     if (url.pathname === "/device-register" && request.method === "POST") {
       const body = await request.json<DeviceRegistration>();
-      this.registrations.set(body.pairingCode, body);
+      const pairingCode = body.pairingCode.trim().toUpperCase();
+      const registration: DeviceRegistration = {
+        ...body,
+        pairingCode,
+        expiresAt: body.expiresAt,
+      };
+      await this.state.storage.put(`${PAIRING_PREFIX}${pairingCode}`, registration);
+      await this.saveProfile(body.deviceId, body.publicKey, body.displayName);
       return new Response("ok");
     }
 
@@ -55,17 +82,26 @@ export class RoomDurableObject implements DurableObject {
         publicKey: string;
         displayName: string;
       }>();
-      const registration = this.registrations.get(body.pairingCode);
-      if (!registration || registration.expiresAt < Date.now()) {
-        return new Response("invalid", { status: 400 });
+      const pairingCode = body.pairingCode.trim().toUpperCase();
+      if (pairingCode.length < 6) {
+        return new Response("invalid length", { status: 400 });
       }
-      const ownerDevices = this.trusted.get(registration.deviceId) ?? new Set();
-      ownerDevices.add(body.deviceId);
-      this.trusted.set(registration.deviceId, ownerDevices);
-      const claimerDevices = this.trusted.get(body.deviceId) ?? new Set();
-      claimerDevices.add(registration.deviceId);
-      this.trusted.set(body.deviceId, claimerDevices);
-      this.registrations.delete(body.pairingCode);
+      const registration = await this.state.storage.get<DeviceRegistration>(
+        `${PAIRING_PREFIX}${pairingCode}`,
+      );
+      if (!registration) {
+        return new Response("not found", { status: 400 });
+      }
+      if (registration.expiresAt < Date.now()) {
+        return new Response("expired", { status: 400 });
+      }
+      if (registration.deviceId === body.deviceId) {
+        return new Response("self claim", { status: 400 });
+      }
+      await this.saveProfile(registration.deviceId, registration.publicKey, registration.displayName);
+      await this.saveProfile(body.deviceId, body.publicKey, body.displayName);
+      await this.addTrustedRelation(registration.deviceId, body.deviceId);
+      await this.state.storage.delete(`${PAIRING_PREFIX}${pairingCode}`);
       return Response.json({
         deviceId: registration.deviceId,
         publicKey: registration.publicKey,
@@ -76,13 +112,75 @@ export class RoomDurableObject implements DurableObject {
     const trustedMatch = url.pathname.match(/^\/device-trusted\/(.+)$/);
     if (trustedMatch) {
       const deviceId = trustedMatch[1];
-      const ids = Array.from(this.trusted.get(deviceId) ?? []);
-      const result = ids.map((id) => ({
-        deviceId: id,
-        publicKey: "",
-        displayName: id,
-      }));
+      const ids = await this.getTrustedIds(deviceId);
+      const result = await Promise.all(
+        ids.map(async (id) => {
+          const profile = await this.getProfile(id);
+          return {
+            deviceId: id,
+            publicKey: profile?.publicKey ?? "",
+            displayName: profile?.displayName ?? id,
+            online: this.presenceSockets.has(id),
+          };
+        }),
+      );
       return Response.json(result);
+    }
+
+    if (url.pathname === "/device-online-status" && request.method === "POST") {
+      const body = await request.json<{ deviceIds: string[] }>();
+      const online: Record<string, boolean> = {};
+      for (const id of body.deviceIds ?? []) {
+        online[id] = this.presenceSockets.has(id);
+      }
+      return Response.json({ online });
+    }
+
+    if (url.pathname === "/device-trust-check" && request.method === "GET") {
+      const fromDeviceId = url.searchParams.get("from") ?? "";
+      const toDeviceId = url.searchParams.get("to") ?? "";
+      const trusted = await this.getTrustedIds(fromDeviceId);
+      if (!trusted.includes(toDeviceId)) {
+        return new Response("not trusted", { status: 403 });
+      }
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/device-invite" && request.method === "POST") {
+      const body = await request.json<TransferInvite>();
+      await this.state.storage.put(`${INVITE_PREFIX}${body.toDeviceId}`, body);
+      this.pushInvite(body.toDeviceId, body);
+      return new Response("ok");
+    }
+
+    const invitesMatch = url.pathname.match(/^\/device-invites\/(.+)$/);
+    if (invitesMatch && request.method === "GET") {
+      const deviceId = invitesMatch[1];
+      const invite = await this.state.storage.get<TransferInvite>(`${INVITE_PREFIX}${deviceId}`);
+      if (!invite || invite.expiresAt < Date.now()) {
+        if (invite) {
+          await this.state.storage.delete(`${INVITE_PREFIX}${deviceId}`);
+        }
+        return Response.json(null);
+      }
+      return Response.json(invite);
+    }
+
+    if (url.pathname === "/device-invites-consume" && request.method === "POST") {
+      const body = await request.json<{ toDeviceId: string }>();
+      await this.state.storage.delete(`${INVITE_PREFIX}${body.toDeviceId}`);
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/device-presence-ws") {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("Expected websocket", { status: 426 });
+      }
+      const pair = new WebSocketPair();
+      const client = pair[0];
+      const server = pair[1];
+      this.handlePresenceWebSocket(server);
+      return new Response(null, { status: 101, webSocket: client });
     }
 
     if (request.headers.get("Upgrade") !== "websocket") {
@@ -94,6 +192,69 @@ export class RoomDurableObject implements DurableObject {
     const server = pair[1];
     await this.handleWebSocket(server);
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private handlePresenceWebSocket(socket: WebSocket) {
+    socket.accept();
+    let deviceId = "";
+
+    socket.addEventListener("message", (event) => {
+      try {
+        const message = JSON.parse(String(event.data));
+        if (message.type === "presence" && typeof message.deviceId === "string") {
+          deviceId = message.deviceId;
+          this.presenceSockets.set(deviceId, socket);
+          socket.send(JSON.stringify({ type: "presence_ack", deviceId, online: true }));
+          this.broadcastPresence(deviceId, true);
+        }
+      } catch {
+        // ignore malformed messages
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      if (deviceId) {
+        const current = this.presenceSockets.get(deviceId);
+        if (current === socket) {
+          this.presenceSockets.delete(deviceId);
+          this.broadcastPresence(deviceId, false);
+        }
+      }
+    });
+  }
+
+  private pushInvite(deviceId: string, invite: TransferInvite) {
+    const socket = this.presenceSockets.get(deviceId);
+    if (!socket) return;
+    socket.send(
+      JSON.stringify({
+        type: "transfer_invite",
+        inviteId: invite.inviteId,
+        code: invite.code,
+        wsUrl: invite.wsUrl,
+        fromDeviceId: invite.fromDeviceId,
+        fromDisplayName: invite.fromDisplayName,
+        expiresAt: invite.expiresAt,
+      }),
+    );
+  }
+
+  private broadcastPresence(deviceId: string, online: boolean) {
+    const payload = JSON.stringify({ type: "presence_update", deviceId, online });
+    for (const [id, socket] of this.presenceSockets) {
+      if (id !== deviceId) {
+        socket.send(payload);
+      }
+    }
+  }
+
+  private async saveProfile(deviceId: string, publicKey: string, displayName: string) {
+    const profile: DeviceProfile = { deviceId, publicKey, displayName };
+    await this.state.storage.put(`${PROFILE_PREFIX}${deviceId}`, profile);
+  }
+
+  private async getProfile(deviceId: string): Promise<DeviceProfile | null> {
+    return (await this.state.storage.get<DeviceProfile>(`${PROFILE_PREFIX}${deviceId}`)) ?? null;
   }
 
   private async handleWebSocket(socket: WebSocket) {
@@ -145,6 +306,32 @@ export class RoomDurableObject implements DurableObject {
   async alarm(): Promise<void> {
     this.peers.forEach((peer) => peer.socket.close(1000, "room expired"));
     this.peers.clear();
-    await this.state.storage.deleteAll();
+    if (this.roomCode) {
+      const keys = await this.state.storage.list();
+      for (const key of keys.keys) {
+        if (!key.startsWith(PAIRING_PREFIX) &&
+            !key.startsWith(TRUSTED_PREFIX) &&
+            !key.startsWith(PROFILE_PREFIX) &&
+            !key.startsWith(INVITE_PREFIX)) {
+          await this.state.storage.delete(key);
+        }
+      }
+      this.roomCode = "";
+      this.expiresAt = 0;
+    }
+  }
+
+  private async getTrustedIds(deviceId: string): Promise<string[]> {
+    return (await this.state.storage.get<string[]>(`${TRUSTED_PREFIX}${deviceId}`)) ?? [];
+  }
+
+  private async addTrustedRelation(ownerId: string, peerId: string): Promise<void> {
+    const ownerPeers = new Set(await this.getTrustedIds(ownerId));
+    ownerPeers.add(peerId);
+    await this.state.storage.put(`${TRUSTED_PREFIX}${ownerId}`, Array.from(ownerPeers));
+
+    const peerOwners = new Set(await this.getTrustedIds(peerId));
+    peerOwners.add(ownerId);
+    await this.state.storage.put(`${TRUSTED_PREFIX}${peerId}`, Array.from(peerOwners));
   }
 }
