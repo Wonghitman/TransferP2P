@@ -29,11 +29,9 @@ import kotlinx.coroutines.withTimeout
 
 private const val DATA_CHANNEL_LABEL = "transfer"
 private const val BACKPRESSURE_THRESHOLD = 1024 * 1024L
-private const val BACKPRESSURE_LOW_THRESHOLD = 256 * 1024L
 private const val DATA_CHANNEL_OPEN_TIMEOUT_MS = 60_000L
 private const val MSG_TEXT: Byte = 1
 private const val MSG_BINARY: Byte = 2
-private const val MSG_ACK: Byte = 3
 
 class WebRtcSession(
     private val scope: CoroutineScope,
@@ -194,16 +192,6 @@ class WebRtcSession(
         awaitBackpressure(additionalBytes)
     }
 
-    fun sendAck(ackedBytes: Long): Boolean {
-        val frame = ByteArray(9)
-        frame[0] = MSG_ACK
-        for (i in 0 until 8) {
-            frame[i + 1] = ((ackedBytes shr (i * 8)) and 0xFF).toByte()
-        }
-        val channel = dataChannel ?: return false
-        return channel.send(frame)
-    }
-
     suspend fun sendBinaryReliable(bytes: ByteArray, drainAfterSend: Boolean = false) {
         val frame = byteArrayOf(MSG_BINARY) + bytes
         withTimeout(120_000) {
@@ -258,9 +246,6 @@ class WebRtcSession(
 
     val bufferedAmount: Long
         get() = dataChannel?.bufferedAmount ?: 0L
-
-    val bufferedAmountLowThreshold: Long
-        get() = BACKPRESSURE_LOW_THRESHOLD
 
     fun close() {
         dataChannel?.close()
@@ -324,15 +309,6 @@ class WebRtcSession(
             MSG_BINARY -> {
                 if (bytes.size > 1) {
                     incomingChannel.send(DataChannelMessage.Binary(bytes.copyOfRange(1, bytes.size)))
-                }
-            }
-            MSG_ACK -> {
-                if (bytes.size >= 9) {
-                    var acked = 0L
-                    for (i in 0 until 8) {
-                        acked = acked or ((bytes[i + 1].toLong() and 0xFF) shl (i * 8))
-                    }
-                    incomingChannel.send(DataChannelMessage.ChunkAck(acked))
                 }
             }
             else -> {

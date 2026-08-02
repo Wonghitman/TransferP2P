@@ -15,6 +15,12 @@
 3. 发送方：创建房间 → 分享房间码/二维码 → 选文件发送
 4. 接收方：输入房间码加入 → 自动接收并校验 SHA-256
 
+## Web（Compose wasmJs）运行
+
+1. `./gradlew :composeApp:wasmJsBrowserDevelopmentRun`（默认 http://localhost:8080）
+2. Worker `WEB_APP_BASE_URL` 指向该地址；扫码打开 `/join/{code}` 会跳转到网页版并自动进房
+3. 网页 UI 为浮动面板布局，与 Android 客户端共用信令 + WebRTC DataChannel（同 WiFi）
+
 ## 架构要点
 
 - 文件走 WebRTC DataChannel（DTLS 端到端加密）
@@ -22,9 +28,9 @@
 - STUN: `stun.cloudflare.com`（仅 P2P 直连，两台设备需同一 WiFi）
 - 临时配对：房间码 + PAKE 校验
 - 持久设备：配对码登记信任设备
+- Web 端经 `webrtc-kmp` 使用浏览器原生 `RTCPeerConnection`
 
 ## 后续（需 iOS 环境）
 
-- 恢复 `iosMain` / `wasmJsMain` target
+- 恢复 `iosMain` target
 - iOS 通过 CocoaPods 链接 `WebRTC-SDK` 125.6422.05
-- Web 端可退化浏览器原生 `RTCPeerConnection`

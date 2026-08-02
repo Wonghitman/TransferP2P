@@ -1,4 +1,6 @@
+import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.targets.js.webpack.KotlinWebpackConfig
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -7,11 +9,34 @@ plugins {
     alias(libs.plugins.compose.multiplatform)
 }
 
+// Kotlin/Wasm webpack tasks are not compatible with Gradle configuration cache
+// (they hold Project/SoftReference state that cannot be serialized).
+tasks.withType(org.jetbrains.kotlin.gradle.targets.js.webpack.KotlinWebpack::class).configureEach {
+    notCompatibleWithConfigurationCache("Kotlin/Wasm webpack tasks are not configuration-cache compatible")
+}
+
 kotlin {
     androidTarget {
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_11)
         }
+    }
+
+    @OptIn(ExperimentalWasmDsl::class)
+    wasmJs {
+        outputModuleName.set("composeApp")
+        browser {
+            commonWebpackConfig {
+                outputFileName = "composeApp.js"
+                devServer = (devServer ?: KotlinWebpackConfig.DevServer()).apply {
+                    port = 8080
+                    static = (static ?: mutableListOf()).apply {
+                        add(project.projectDir.path)
+                    }
+                }
+            }
+        }
+        binaries.executable()
     }
 
     sourceSets {
@@ -22,11 +47,7 @@ kotlin {
             implementation(compose.material3)
             implementation(compose.ui)
             implementation(compose.components.resources)
-            implementation(libs.decompose)
-            implementation(libs.decompose.extensions.compose)
             implementation(libs.kotlinx.coroutines.core)
-            implementation(libs.koin.core)
-            implementation(libs.koin.compose)
             implementation(libs.okio)
         }
         androidMain.dependencies {

@@ -1,22 +1,92 @@
 package com.oneturn.transfer.pairing
 
+import com.oneturn.transfer.crypto.sha256Hex
 import kotlin.random.Random
 
+/**
+ * BIP39-style room codes: content words + a checksum word derived from SHA-256,
+ * so a mistyped code can be detected before contacting the server.
+ *
+ * Format: `word1-word2-word3-checkword`, all lowercase, 4 words total.
+ * The word list is intentionally shared verbatim with the Worker (`worker/src/index.ts`)
+ * so both ends generate/validate the same codes.
+ */
 object RoomCodeGenerator {
-    private val words = listOf(
-        "apple", "blue", "cloud", "delta", "echo", "flame", "green", "haze",
-        "iris", "jade", "kite", "lime", "mint", "nova", "opal", "pine",
-    )
+    /** Short, easy-to-type, low-ambiguity words. 732 unique words (entropy = 732^3 for the content). */
+    val WORDS: List<String> = """
+        acid acorn amber anchor apple apron arrow atlas bacon badge bagel ball bamboo banner basil
+        basin batch beach beam bean bench berry birch blade blank blaze bloom blouse board boat bolt
+        bonnet book booth bottle bowl box branch brass bread brick bridge broom brush bubble bucket
+        bud bug bulb bulk bush cabin cactus cake calf calm camel canal candle cap cape card cargo carol
+        cart carve case castle cat cedar cell chalk charm chart cheese chest chick chief chime choir
+        chunk cigar circle claim clamp cliff cloak clock cloud club coach coast cobra cocoa coil coin
+        comb comet cone cook coral cord corn couch cover crane crate crest cricket crown cube curl
+        curve cycle daisy dance dawn deck denim depth desk dial dice digit dill dime disc dock dog doll
+        dome door dot dove draft drain dream drift drill drum duck dusk dust dwarf eagle earn earth echo
+        edge eel egg elf elk elm ember emu envy epic era error essay eve exit face fade fang farm fast
+        fault fern field fig film finch fire fish flame flap fleet flight floor flute fly foam fog fold
+        foot force fork form fort fox frame frost fuel fund fuse gain gate gear gem gift globe glow glue
+        goal gold golf gown grain grape grass green grill guard guest guide gum gust hair halo harp hawk
+        haze heart hedge herd hero hill hint hive honey horn horse host hound hut ice icon idea inch ink
+        iris iron island ivy jade jam jar jazz jeep jewel joint jolly jumbo june ketch key kilo kite kiwi
+        ladder lake lamp lane lapel laugh lava leaf leash lemon lens lily lime linen lion lip loaf lobby
+        lock lodge loft log loop loose lotus love lump lunch lung lyre magic magnet maple march mare mask
+        mast match maze meal medal melon memo menu mesh metal meter milk mint mirror mist moat mode mold
+        mole moon moss moth motor mound mouse mouth mud mug napkin nectar nest net newt next niece night
+        noble node noon north nose note oak oar oat ocean offer oil olive omen onion open opera orbit
+        order otter oven owl ox panda pane paper park part pass paste patio paw peace peach pearl pebble
+        pedal penny petal photo piano pick picnic pier pig pill pilot pin pinch pine pink pint pipe plain
+        plant plate plaza plum point poke polar pond pony pool port post pot prism probe prop pulse pump
+        punch pup quail quartz queen quill quilt quiver rabbit rack raft rail rain rally ranch range rattle
+        raven reach reed reel relay rice ridge ring risk rival river road robin rock rodeo role roll roof
+        room rope rose row royal ruby rug ruler rune rust sack sage sail salad salt sand sash sauce scale
+        scarf scent scoop scout scrap sea seed seek shade shaft shape shed shell shift ship shock shore
+        short shot shrimp sieve sign silk silver sing sink sip sir site skate sketch skid skill skin skull
+        slate sled sleep slice slide sling slip slope small smell smile smoke snail snake snap snow soap
+        sock sofa sonar song sort south space spade sparrow spear spell spice spider spike spill spine
+        spoon spore spot spray spring spur squad squash stable staff stage stain stair stamp star start
+        state stem step stick still sting stitch stone stool storm story stove strand strap straw stream
+        street stride strike string strip strong study stump style sub suit sum sun surf swirl switch
+        sword syrup table tail tale talk tank tape task tea teach team tear tech tell tent term test text
+        thaw thief thing thumb tide tiger tile tilt time tin tint tiny tip toast toe tomb tone tool tooth
+        top torch total touch tough tour town trace track trade trail train trait trap tray treat tree
+        trend tribe trick trim trip troop trout truck trunk try tub tube tune turf turn tutor twig twin
+        twist type uncle under unit upper urban urge urn use value van vanish vase vault vein velvet vent
+        verb verse vest veto video view vine vinyl violet visit voice volt vote wage wagon waist wait wake
+        walk wall walnut wand wave wax web wedge weed week weld well west wheat wheel whip white whole
+        wick wide wild will win wind window wine wing wink wipe wire wise wish witch wolf wood wool word
+        work worm wrap wrist yard yarn year yell yoga young zebra
+    """.trimIndent().split(Regex("\\s+")).filter { it.isNotEmpty() }
 
-    fun generateNumeric(length: Int = 6): String =
-        buildString(length) {
-            repeat(length) { append(Random.nextInt(10)) }
-        }
+    init {
+        require(WORDS.size >= 128) { "Room code word list too small: ${WORDS.size}" }
+        require(WORDS.distinct().size == WORDS.size) { "Room code word list contains duplicates" }
+    }
 
-    fun generateMnemonic(wordCount: Int = 4): String =
-        (1..wordCount)
-            .map { words.random() }
-            .joinToString("-")
+    const val CONTENT_WORDS = 3
+
+    /** Generate a full code: 3 random content words + 1 checksum word. */
+    fun generate(): String {
+        val content = List(CONTENT_WORDS) { WORDS[Random.nextInt(WORDS.size)] }
+        return (content + checksumWord(content)).joinToString("-")
+    }
+
+    /** Validate a full code including the checksum word. */
+    fun isValid(input: String): Boolean {
+        val words = normalize(input).split("-")
+        if (words.size != CONTENT_WORDS + 1) return false
+        val content = words.take(CONTENT_WORDS)
+        if (content.any { it !in WORDS }) return false
+        return checksumWord(content) == words.last()
+    }
+
+    /** Checksum word = word at SHA-256(first CONTENT_WORDS words)[0] % 256. */
+    fun checksumWord(contentWords: List<String>): String {
+        val digest = sha256Hex(contentWords.joinToString("-"))
+        val index = (digest.firstOrNull()?.digitToIntOrNull(16) ?: 0) * 16 +
+            (digest.getOrNull(1)?.digitToIntOrNull(16) ?: 0)
+        return WORDS[index % WORDS.size]
+    }
 
     fun normalize(input: String): String = input.trim().lowercase()
 

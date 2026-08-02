@@ -3,7 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2026-01-01"
 
 [vars]
-PUBLIC_BASE_URL = "https://sendmaster.saimai.workers.dev"
+PUBLIC_BASE_URL = "https://sendmaster.1turn.cn"
+# Compose wasm web app origin (local: http://localhost:8080). Join links redirect here with ?code=
+WEB_APP_BASE_URL = "http://localhost:8080"
 ROOM_TTL_SECONDS = "3600"
 
 [[durable_objects.bindings]]

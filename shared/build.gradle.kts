@@ -1,3 +1,4 @@
+import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -13,6 +14,11 @@ kotlin {
         }
     }
 
+    @OptIn(ExperimentalWasmDsl::class)
+    wasmJs {
+        browser()
+    }
+
     sourceSets {
         commonMain.dependencies {
             implementation(libs.kotlinx.coroutines.core)
@@ -25,7 +31,6 @@ kotlin {
             implementation(libs.multiplatform.settings)
             implementation(libs.webrtc.kmp)
             implementation(libs.qrcode.kotlin)
-            implementation(libs.koin.core)
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
@@ -37,6 +42,9 @@ kotlin {
             implementation(libs.androidx.core.ktx)
             implementation(libs.zxing.android.embedded)
             implementation("com.squareup.okhttp3:okhttp:4.12.0")
+        }
+        wasmJsMain.dependencies {
+            implementation(libs.ktor.client.js)
         }
     }
 }

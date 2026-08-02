@@ -308,7 +308,7 @@ export class RoomDurableObject implements DurableObject {
     this.peers.clear();
     if (this.roomCode) {
       const keys = await this.state.storage.list();
-      for (const key of keys.keys) {
+      for (const key of keys.keys()) {
         if (!key.startsWith(PAIRING_PREFIX) &&
             !key.startsWith(TRUSTED_PREFIX) &&
             !key.startsWith(PROFILE_PREFIX) &&

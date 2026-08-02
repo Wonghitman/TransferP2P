@@ -3,6 +3,7 @@ package com.oneturn.transfer.crypto
 import okio.HashingSink
 import okio.blackholeSink
 import okio.buffer
+import okio.use
 
 fun sha256Hex(data: ByteArray): String {
     val sink = HashingSink.sha256(blackholeSink())

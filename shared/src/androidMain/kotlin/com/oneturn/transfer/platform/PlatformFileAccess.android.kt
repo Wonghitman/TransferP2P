@@ -11,6 +11,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import com.oneturn.transfer.transfer.TransferManifest
 import kotlinx.coroutines.CompletableDeferred
+import okio.buffer
 import okio.sink
 import okio.source
 import java.io.File
@@ -80,6 +81,57 @@ actual fun createReceiveSink(manifest: TransferManifest): okio.Sink {
     val file = File(dir, "${manifest.transferId}-$safeName")
     receiveFiles[manifest.transferId] = file
     return file.sink()
+}
+
+actual fun spoolAndHash(source: okio.Source): SpooledSource =
+    SpooledSourceImpl(spoolToTempFile(source))
+
+private fun spoolToTempFile(source: okio.Source): File {
+    val dir = File(appContext.cacheDir, "spool")
+    dir.mkdirs()
+    val file = File.createTempFile("xfer", ".bin", dir)
+    try {
+        val hashSink = okio.HashingSink.sha256(file.sink())
+        hashSink.buffer().use { out ->
+            source.buffer().use { input -> input.readAll(out) }
+        }
+        spoolHashes[file.absolutePath] = hashSink.hash.hex()
+        return file
+    } catch (e: Exception) {
+        file.delete()
+        throw e
+    }
+}
+
+private val spoolHashes = mutableMapOf<String, String>()
+
+private class SpooledSourceImpl(
+    private val file: File,
+) : SpooledSource {
+    private val raf = java.io.RandomAccessFile(file, "r")
+
+    override val sizeBytes: Long
+        get() = file.length()
+
+    override val sha256: String
+        get() = spoolHashes[file.absolutePath] ?: ""
+
+    override fun readChunk(index: Int, chunkSize: Int): ByteArray {
+        val offset = index.toLong() * chunkSize
+        val remaining = sizeBytes - offset
+        if (remaining <= 0) return ByteArray(0)
+        val len = minOf(remaining, chunkSize.toLong()).toInt()
+        val bytes = ByteArray(len)
+        raf.seek(offset)
+        raf.readFully(bytes)
+        return bytes
+    }
+
+    override fun close() {
+        raf.close()
+        spoolHashes.remove(file.absolutePath)
+        file.delete()
+    }
 }
 
 actual fun publishReceivedFile(manifest: TransferManifest): String {

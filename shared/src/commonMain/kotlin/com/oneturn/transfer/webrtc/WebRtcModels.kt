@@ -34,5 +34,4 @@ enum class PeerRole {
 sealed interface DataChannelMessage {
     data class Text(val text: String) : DataChannelMessage
     data class Binary(val bytes: ByteArray) : DataChannelMessage
-    data class ChunkAck(val ackedBytes: Long) : DataChannelMessage
 }

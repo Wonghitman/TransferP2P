@@ -1,6 +1,8 @@
 package com.oneturn.transfer.transfer
 
+import com.oneturn.transfer.platform.monotonicNanos
 import com.oneturn.transfer.platform.publishReceivedFile
+import com.oneturn.transfer.platform.spoolAndHash
 import com.oneturn.transfer.webrtc.WebRtcSession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -21,13 +23,13 @@ import okio.BufferedSink
 import okio.HashingSink
 import okio.Sink
 import okio.Source
-import okio.blackholeSink
 import okio.buffer
+import okio.use
 
 /**
- * Pull-based block transfer (similar to BitTorrent):
- * receiver requests each chunk; sender only responds to requests.
- * This prevents the sender from outpacing the receiver on WebRTC DataChannel.
+ * Push-based block transfer (LocalSend-style):
+ * the sender streams every chunk onto the ordered/reliable DataChannel,
+ * the receiver writes chunks in arrival order. No per-chunk request round-trips.
  */
 class FileTransferSender(
     private val session: WebRtcSession,
@@ -37,13 +39,7 @@ class FileTransferSender(
     private val _progress = MutableStateFlow(TransferProgress())
     val progress: StateFlow<TransferProgress> = _progress.asStateFlow()
 
-    private val requestQueue = Channel<Int>(Channel.UNLIMITED)
     private var activeTransferId: String? = null
-
-    fun onBlockRequest(request: BlockRequest) {
-        if (request.transferId != activeTransferId) return
-        requestQueue.trySend(request.chunkIndex)
-    }
 
     suspend fun send(
         fileName: String,
@@ -52,105 +48,92 @@ class FileTransferSender(
         source: Source,
     ) {
         activeTransferId = transferId
-        while (requestQueue.tryReceive().isSuccess) {
-            // drain stale requests
-        }
-
-        val chunks = readAllChunks(source, chunkSize)
-        val sizeBytes = chunks.sumOf { it.size.toLong() }
-        val totalChunks = chunks.size
-        val manifest = TransferManifest(
-            transferId = transferId,
-            fileName = fileName,
-            mimeType = mimeType,
-            sizeBytes = sizeBytes,
-            chunkSize = chunkSize,
-            totalChunks = totalChunks,
-            sha256 = "",
-        )
 
         _progress.value = TransferProgress(
             phase = TransferPhase.Handshaking,
             fileName = fileName,
-            totalBytes = sizeBytes,
             message = "准备发送...",
         )
-        session.sendTextReliable(json.encodeToString(TransferManifest.serializer(), manifest), drainAfterSend = true)
 
-        val hashSink = HashingSink.sha256(blackholeSink())
-        hashSink.buffer().use { hashBuffer ->
-            chunks.forEach { hashBuffer.write(it) }
-        }
-        hashSink.close()
-        val digest = hashSink.hash.hex()
+        spoolAndHash(source).use { data ->
+            val sizeBytes = data.sizeBytes
+            val totalChunks = estimateChunkCount(sizeBytes, chunkSize)
+            val manifest = TransferManifest(
+                transferId = transferId,
+                fileName = fileName,
+                mimeType = mimeType,
+                sizeBytes = sizeBytes,
+                chunkSize = chunkSize,
+                totalChunks = totalChunks,
+                sha256 = data.sha256,
+            )
 
-        _progress.value = _progress.value.copy(
-            phase = TransferPhase.Transferring,
-            totalBytes = sizeBytes,
-            message = "等待接收方请求分片...",
-        )
-
-        var sentBytes = 0L
-        var lastReportNanos = System.nanoTime()
-        var lastReportBytes = 0L
-        val sentIndices = mutableSetOf<Int>()
-
-        while (sentIndices.size < totalChunks && currentCoroutineContext().isActive) {
-            val requestedIndex = withTimeoutOrNull(REQUEST_TIMEOUT_MS) {
-                requestQueue.receive()
-            } ?: throw IllegalStateException("接收方未请求分片，传输超时")
-
-            if (requestedIndex < 0 || requestedIndex >= totalChunks) continue
-
-            val chunk = chunks[requestedIndex]
-            session.sendBinaryReliable(encodeFrame(requestedIndex, chunk), drainAfterSend = true)
-            if (sentIndices.add(requestedIndex)) {
-                sentBytes += chunk.size
-            }
-
-            val now = System.nanoTime()
-            var bytesPerSecond = _progress.value.bytesPerSecond
-            if (now - lastReportNanos >= 500_000_000) {
-                val elapsedSec = (now - lastReportNanos) / 1_000_000_000.0
-                val delta = sentBytes - lastReportBytes
-                bytesPerSecond = if (elapsedSec > 0) delta / elapsedSec else 0.0
-                lastReportNanos = now
-                lastReportBytes = sentBytes
-            }
             _progress.value = _progress.value.copy(
+                phase = TransferPhase.Handshaking,
+                totalBytes = sizeBytes,
+                message = "准备发送...",
+            )
+            session.sendTextReliable(json.encodeToString(TransferManifest.serializer(), manifest), drainAfterSend = true)
+
+            _progress.value = _progress.value.copy(
+                phase = TransferPhase.Transferring,
+                totalBytes = sizeBytes,
+                message = "正在发送...",
+            )
+
+            var sentBytes = 0L
+            var lastReportNanos = monotonicNanos()
+            var lastReportBytes = 0L
+
+            for (index in 0 until totalChunks) {
+                if (!currentCoroutineContext().isActive) break
+                val chunk = data.readChunk(index, chunkSize)
+                session.sendBinaryReliable(encodeFrame(index, chunk))
+                sentBytes += chunk.size
+
+                val now = monotonicNanos()
+                if (now - lastReportNanos >= 200_000_000) {
+                    val elapsedSec = (now - lastReportNanos) / 1_000_000_000.0
+                    val delta = sentBytes - lastReportBytes
+                    val bytesPerSecond = if (elapsedSec > 0) delta / elapsedSec else 0.0
+                    lastReportNanos = now
+                    lastReportBytes = sentBytes
+                    _progress.value = _progress.value.copy(
+                        bytesSent = sentBytes,
+                        totalBytes = sizeBytes,
+                        bytesPerSecond = bytesPerSecond,
+                        message = "已发送 $sentBytes/$sizeBytes 字节",
+                    )
+                }
+            }
+
+            session.awaitDrain()
+            _progress.value = _progress.value.copy(
+                phase = TransferPhase.Verifying,
+                bytesSent = sentBytes,
+                message = "发送完成信息...",
+            )
+            session.sendBinaryReliable(
+                encodeFrame(
+                    FRAME_COMPLETE,
+                    json.encodeToString(
+                        TransferComplete.serializer(),
+                        TransferComplete(
+                            transferId = manifest.transferId,
+                            sha256 = data.sha256,
+                            sizeBytes = sentBytes,
+                        ),
+                    ).encodeToByteArray(),
+                ),
+                drainAfterSend = true,
+            )
+            _progress.value = _progress.value.copy(
+                phase = TransferPhase.Completed,
                 bytesSent = sentBytes,
                 totalBytes = sizeBytes,
-                bytesPerSecond = bytesPerSecond,
-                message = "已发送 ${sentIndices.size}/$totalChunks 片",
+                message = "",
             )
         }
-
-        session.awaitDrain()
-        _progress.value = _progress.value.copy(
-            phase = TransferPhase.Verifying,
-            bytesSent = sentBytes,
-            message = "发送完成信息...",
-        )
-        session.sendBinaryReliable(
-            encodeFrame(
-                FRAME_COMPLETE,
-                json.encodeToString(
-                    TransferComplete.serializer(),
-                    TransferComplete(
-                        transferId = manifest.transferId,
-                        sha256 = digest,
-                        sizeBytes = sentBytes,
-                    ),
-                ).encodeToByteArray(),
-            ),
-            drainAfterSend = true,
-        )
-        _progress.value = _progress.value.copy(
-            phase = TransferPhase.Completed,
-            bytesSent = sentBytes,
-            totalBytes = sizeBytes,
-            message = "",
-        )
         activeTransferId = null
     }
 
@@ -164,7 +147,6 @@ class FileTransferSender(
     companion object {
         const val DEFAULT_CHUNK_SIZE = 16 * 1024
         const val FRAME_COMPLETE = -1
-        const val REQUEST_TIMEOUT_MS = 60_000L
     }
 }
 
@@ -265,8 +247,12 @@ class FileTransferReceiver(
         if (frameType < 0) return
         if (manifest == null) return
 
+        // Push protocol: chunks must arrive in order.
         if (frameType != receivedChunks) {
-            requestChunk(receivedChunks)
+            _progress.value = _progress.value.copy(
+                phase = TransferPhase.Failed,
+                message = "分片顺序异常（期望 $receivedChunks，收到 $frameType）",
+            )
             return
         }
         writeChunk(payload)
@@ -298,7 +284,7 @@ class FileTransferReceiver(
         receivedChunks++
         updateProgress()
 
-        val now = System.nanoTime()
+        val now = monotonicNanos()
         if (now - lastReportNanos >= 500_000_000) {
             val elapsedSec = (now - lastReportNanos) / 1_000_000_000.0
             val delta = receivedBytes - lastReportBytes
@@ -308,26 +294,10 @@ class FileTransferReceiver(
             lastReportBytes = receivedBytes
         }
 
-        if (receivedChunks < totalChunks) {
-            requestChunk(receivedChunks)
-        } else {
+        if (receivedChunks >= totalChunks) {
             scheduleAwaitComplete()
         }
         tryFinalizeIfReady()
-    }
-
-    private suspend fun requestChunk(index: Int) {
-        val current = manifest ?: return
-        session.sendTextReliable(
-            json.encodeToString(
-                BlockRequest.serializer(),
-                BlockRequest(
-                    transferId = current.transferId,
-                    chunkIndex = index,
-                ),
-            ),
-            drainAfterSend = true,
-        )
     }
 
     private fun updateProgress() {
@@ -396,7 +366,6 @@ class FileTransferReceiver(
             totalBytes = parsed.sizeBytes,
             message = "开始接收...",
         )
-        requestChunk(0)
     }
 
     private suspend fun verifyAndComplete(complete: TransferComplete) {
@@ -503,45 +472,6 @@ class FileTransferReceiver(
         totalChunks = 0
         pendingComplete = null
     }
-}
-
-private fun readAllChunks(source: Source, chunkSize: Int): List<ByteArray> {
-    val chunks = mutableListOf<ByteArray>()
-    val buffer = ByteArray(chunkSize)
-    source.buffer().use { input ->
-        while (true) {
-            val read = input.read(buffer)
-            if (read == -1) break
-            chunks.add(if (read == buffer.size) buffer.copyOf() else buffer.copyOf(read))
-        }
-    }
-    return chunks
-}
-
-fun computeSha256(source: Source): String = computeSha256AndSize(source).first
-
-fun computeSha256AndSize(source: Source): Pair<String, Long> {
-    val hashSink = HashingSink.sha256(blackholeSink())
-    val size = source.buffer().use { input ->
-        hashSink.buffer().use { output ->
-            output.writeAll(input)
-        }
-    }
-    hashSink.close()
-    return hashSink.hash.hex() to size
-}
-
-fun measureSourceSize(source: Source): Long {
-    val buffer = ByteArray(64 * 1024)
-    var total = 0L
-    source.buffer().use { input ->
-        while (true) {
-            val read = input.read(buffer)
-            if (read == -1) break
-            total += read
-        }
-    }
-    return total
 }
 
 fun estimateChunkCount(sizeBytes: Long, chunkSize: Int): Int =

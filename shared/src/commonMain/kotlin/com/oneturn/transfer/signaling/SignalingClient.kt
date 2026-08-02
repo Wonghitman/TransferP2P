@@ -6,7 +6,6 @@ import com.oneturn.transfer.platform.createHttpClient
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.BufferOverflow
@@ -133,14 +132,22 @@ class SignalingClient(
     fun connect(wsUrl: String, role: SignalingRole, deviceId: String? = null) {
         disconnect()
         _incoming.resetReplayCache()
+        val normalized = normalizeWebSocketUrl(wsUrl)
         sessionJob = scope.launch {
-            launchWebSocketSession(wsUrl, role, deviceId, this)
+            launchWebSocketSession(normalized, role, deviceId, this)
         }
     }
 
     suspend fun waitUntilConnected(timeoutMs: Long = 30_000) {
-        withTimeout(timeoutMs) {
-            connectionState.first { it == SignalingConnectionState.Connected }
+        try {
+            withTimeout(timeoutMs) {
+                connectionState.first { it == SignalingConnectionState.Connected }
+            }
+        } catch (e: Throwable) {
+            throw IllegalStateException(
+                "信令 WebSocket 连接超时（请确认 wsUrl 为 wss://）: ${e.message ?: "timeout"}",
+                e,
+            )
         }
     }
 
@@ -178,7 +185,7 @@ class SignalingClient(
         _incoming.emit(message)
     }
 
-    internal suspend fun drainOutbound(send: (String) -> Boolean) {
+    internal suspend fun drainOutbound(send: suspend (String) -> Boolean) {
         for (message in outbound) {
             if (!send(message)) break
         }
@@ -193,7 +200,7 @@ class SignalingClient(
     private suspend fun <T> withNetworkRetry(
         attempts: Int = 3,
         block: suspend () -> T,
-    ): T = withContext(Dispatchers.IO) {
+    ): T = withContext(Dispatchers.Default) {
         var lastError: Throwable? = null
         repeat(attempts) { attempt ->
             try {
@@ -217,4 +224,11 @@ enum class SignalingConnectionState {
     Connecting,
     Connected,
     Reconnecting,
+}
+
+/** Browser WebSocket requires ws/wss; Worker historically returned http/https. */
+internal fun normalizeWebSocketUrl(url: String): String = when {
+    url.startsWith("https://") -> "wss://" + url.removePrefix("https://")
+    url.startsWith("http://") -> "ws://" + url.removePrefix("http://")
+    else -> url
 }

@@ -15,19 +15,6 @@ data class TransferManifest(
 )
 
 @Serializable
-data class TransferAck(
-    val transferId: String,
-    val chunkIndex: Int,
-)
-
-@Serializable
-data class BlockRequest(
-    val type: String = "request",
-    val transferId: String,
-    val chunkIndex: Int,
-)
-
-@Serializable
 data class TransferComplete(
     val type: String = "end",
     val transferId: String,

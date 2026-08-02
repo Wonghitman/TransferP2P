@@ -16,3 +16,7 @@
 local.properties
 worker/.dev.vars
 .hotswan/
+.kotlin/
+kotlin-js-store/
+*.log
+build_compile.log

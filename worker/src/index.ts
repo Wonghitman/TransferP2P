@@ -1,4 +1,5 @@
 import { RoomDurableObject } from "./room";
+import { ROOM_WORDS } from "./room-words";
 
 export { RoomDurableObject };
 
@@ -23,6 +24,11 @@ export default {
 
       if (url.pathname === "/debug" && request.method === "GET") {
         return withCors(debugPage());
+      }
+
+      const joinMatch = url.pathname.match(/^\/join\/([^/]+)$/);
+      if (joinMatch && request.method === "GET") {
+        return withCors(joinLandingPage(joinMatch[1], env));
       }
 
       if (url.pathname === "/rooms" && request.method === "POST") {
@@ -113,6 +119,51 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
+function joinLandingPage(code: string, env: Env): Response {
+  const webBase = (env.WEB_APP_BASE_URL || "http://localhost:8080").replace(/\/$/, "");
+  const target = `${webBase}/?code=${encodeURIComponent(code)}`;
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="refresh" content="0;url=${target}" />
+  <title>加入传输房间</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: linear-gradient(160deg, #0B1F2A, #163A2E);
+      color: #E8F5EF;
+    }
+    a { color: #3DDC97; }
+    .card {
+      max-width: 28rem;
+      padding: 2rem;
+      border-radius: 1.25rem;
+      background: rgba(21, 31, 39, 0.92);
+      box-shadow: 0 16px 40px rgba(0,0,0,.35);
+      text-align: center;
+    }
+  </style>
+  <script>location.replace(${JSON.stringify(target)});</script>
+</head>
+<body>
+  <div class="card">
+    <h1>正在打开网页版</h1>
+    <p>房间码：<strong>${code}</strong></p>
+    <p>若未自动跳转，请点击 <a href="${target}">进入 Transfer P2P</a></p>
+  </div>
+</body>
+</html>`;
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
 function debugPage(): Response {
   const html = `<!DOCTYPE html>
 <html lang="zh">
@@ -165,6 +216,37 @@ function debugPage(): Response {
   });
 }
 
+const CONTENT_WORDS = 3;
+
+async function generateRoomCode(): Promise<string> {
+  const content: string[] = [];
+  for (let i = 0; i < CONTENT_WORDS; i++) {
+    content.push(ROOM_WORDS[Math.floor(Math.random() * ROOM_WORDS.length)]);
+  }
+  const check = await checksumWord(content);
+  return [...content, check].join("-");
+}
+
+/** Checksum word = word at SHA-256(first CONTENT_WORDS words)[0] % ROOM_WORDS.length. */
+async function checksumWord(contentWords: string[]): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(contentWords.join("-")),
+  );
+  const bytes = new Uint8Array(digest);
+  const index = bytes[0] % ROOM_WORDS.length;
+  return ROOM_WORDS[index];
+}
+
+/** Validate a full code including the checksum word (shared algorithm with the client). */
+async function isValidRoomCode(input: string): Promise<boolean> {
+  const words = input.trim().toLowerCase().split("-");
+  if (words.length !== CONTENT_WORDS + 1) return false;
+  const content = words.slice(0, CONTENT_WORDS);
+  if (content.some((w) => !ROOM_WORDS.includes(w))) return false;
+  return (await checksumWord(content)) === words[CONTENT_WORDS];
+}
+
 async function createRoom(_request: Request, env: Env): Promise<Response> {
   return json(await createRoomInternal(env));
 }
@@ -175,7 +257,7 @@ async function createRoomInternal(env: Env): Promise<{
   wsUrl: string;
   expiresAt: number;
 }> {
-  const code = generateRoomCode();
+  const code = await generateRoomCode();
   const id = env.ROOM.idFromName(code);
   const stub = env.ROOM.get(id);
   const ttl = Number(env.ROOM_TTL_SECONDS || "3600");
@@ -188,12 +270,15 @@ async function createRoomInternal(env: Env): Promise<{
   return {
     code,
     joinUrl: `${base}/join/${code}`,
-    wsUrl: `${base}/rooms/${code}/ws`,
+    wsUrl: toWebSocketUrl(base, `/rooms/${code}/ws`),
     expiresAt,
   };
 }
 
 async function joinRoom(code: string, env: Env): Promise<Response> {
+  if (!(await isValidRoomCode(code))) {
+    return json({ error: "Room code failed checksum" }, 400);
+  }
   const id = env.ROOM.idFromName(code);
   const stub = env.ROOM.get(id);
   const response = await stub.fetch("https://room/status");
@@ -204,9 +289,20 @@ async function joinRoom(code: string, env: Env): Promise<Response> {
   const base = env.PUBLIC_BASE_URL.replace(/\/$/, "");
   return json({
     code,
-    wsUrl: `${base}/rooms/${code}/ws`,
+    wsUrl: toWebSocketUrl(base, `/rooms/${code}/ws`),
     expiresAt: status.expiresAt,
   });
+}
+
+/** Browser WebSocket needs ws/wss; http(s) breaks wasm/web clients. */
+function toWebSocketUrl(httpBase: string, path: string): string {
+  const base = httpBase.replace(/\/$/, "");
+  const wsBase = base.startsWith("https://")
+    ? `wss://${base.slice("https://".length)}`
+    : base.startsWith("http://")
+      ? `ws://${base.slice("http://".length)}`
+      : base;
+  return `${wsBase}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 async function connectRoomWebSocket(
@@ -361,11 +457,6 @@ async function connectDevicePresenceWebSocket(
   const id = env.ROOM.idFromName("device-registry");
   const stub = env.ROOM.get(id);
   return stub.fetch("https://room/device-presence-ws", request);
-}
-
-function generateRoomCode(): string {
-  const words = ["apple", "blue", "cloud", "delta", "echo", "flame", "green", "haze"];
-  return Array.from({ length: 4 }, () => words[Math.floor(Math.random() * words.length)]).join("-");
 }
 
 function generatePairingCode(): string {

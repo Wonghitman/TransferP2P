@@ -1,21 +1,22 @@
 package com.oneturn.transfer.api
 
-import com.oneturn.transfer.chat.ChatLine
+import com.oneturn.transfer.chat.ChatItem
 import com.oneturn.transfer.chat.ChatMessagePayload
-import com.oneturn.transfer.chat.toChatLine
+import com.oneturn.transfer.chat.toChatItemText
 import com.oneturn.transfer.identity.DeviceIdentityRepository
 import com.oneturn.transfer.identity.DeviceRegistry
 import com.oneturn.transfer.identity.TrustedDevice
 import com.oneturn.transfer.pairing.PairingService
 import com.oneturn.transfer.pairing.RoomInfo
+import com.oneturn.transfer.platform.createAppSettings
 import com.oneturn.transfer.platform.createReceiveSink
+import com.oneturn.transfer.platform.requireWebRtcAvailable
 import com.oneturn.transfer.presence.DevicePresenceClient
 import com.oneturn.transfer.presence.TransferInvite
 import com.oneturn.transfer.signaling.InviteDeviceRequest
 import com.oneturn.transfer.signaling.SignalingClient
 import com.oneturn.transfer.signaling.SignalingMessage
 import com.oneturn.transfer.signaling.SignalingRole
-import com.oneturn.transfer.transfer.BlockRequest
 import com.oneturn.transfer.transfer.FileTransferReceiver
 import com.oneturn.transfer.transfer.FileTransferSender
 import com.oneturn.transfer.transfer.TransferPhase
@@ -25,7 +26,6 @@ import com.oneturn.transfer.webrtc.DataChannelMessage
 import com.oneturn.transfer.webrtc.IceServerConfig
 import com.oneturn.transfer.webrtc.PeerAddressFamily
 import com.oneturn.transfer.webrtc.WebRtcCoordinator
-import com.oneturn.transfer.platform.createAppSettings
 import com.russhwolf.settings.Settings
 import com.shepeliev.webrtckmp.DataChannelState
 import kotlinx.coroutines.CoroutineScope
@@ -38,15 +38,18 @@ import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
+import okio.use
 import okio.Source
 import kotlin.random.Random
 import kotlin.time.Clock
 
 class TransferSessionManager(
-    private val baseUrl: String,
+    baseUrl: String,
     private val scope: CoroutineScope,
     settings: Settings = createAppSettings(),
 ) {
+    private val baseUrl = baseUrl.trimEnd('/')
+
     val signaling = SignalingClient(baseUrl, scope = scope)
     val pairing = PairingService(signaling, scope)
     val identityRepository = DeviceIdentityRepository(settings)
@@ -88,8 +91,8 @@ class TransferSessionManager(
     private val _statusMessage = MutableStateFlow("")
     val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
 
-    private val _chatMessages = MutableStateFlow<List<ChatLine>>(emptyList())
-    val chatMessages: StateFlow<List<ChatLine>> = _chatMessages.asStateFlow()
+    private val _chatMessages = MutableStateFlow<List<ChatItem>>(emptyList())
+    val chatMessages: StateFlow<List<ChatItem>> = _chatMessages.asStateFlow()
 
     private val _pendingInvite = MutableStateFlow<TransferInvite?>(null)
     val pendingInvite: StateFlow<TransferInvite?> = _pendingInvite.asStateFlow()
@@ -224,46 +227,92 @@ class TransferSessionManager(
             timestamp = Clock.System.now().toEpochMilliseconds(),
         )
         session.sendText(chatJson.encodeToString(ChatMessagePayload.serializer(), payload))
-        appendChatLine(payload.toChatLine(identity.deviceId))
+        appendChatItem(payload.toChatItemText(identity.deviceId))
     }
 
-    suspend fun sendFile(
+    fun sendFile(
         fileName: String,
         mimeType: String,
         sizeBytes: Long,
         openSource: () -> Source,
     ) {
-        val session = requireActiveSession()
-        ensureDataChannelReady(session)
-        val transferId = generateTransferId()
-        val fileSender = FileTransferSender(session)
-        sender = fileSender
-        _senderProgress.value = TransferProgress(
-            phase = TransferPhase.Handshaking,
-            fileName = fileName,
-            message = "准备发送...",
+        val now = Clock.System.now().toEpochMilliseconds()
+        appendChatItem(
+            ChatItem.File(
+                transferId = "pending-${now}",
+                fileName = fileName,
+                sizeBytes = sizeBytes,
+                isMine = true,
+                timestamp = now,
+                phase = TransferPhase.Handshaking,
+                message = "准备发送...",
+            ),
         )
-        _statusMessage.value = "正在发送: $fileName"
+        val pendingId = "file-pending-${now}"
         transferJobs += scope.launch {
-            fileSender.progress.collect { progress ->
-                _senderProgress.value = progress
-                when (progress.phase) {
-                    TransferPhase.Handshaking,
-                    TransferPhase.Transferring,
-                    -> _statusMessage.value = progress.message.ifBlank {
-                        "正在发送: ${progress.fileName}"
+            runCatching {
+                val session = requireActiveSession()
+                ensureDataChannelReady(session)
+                val transferId = generateTransferId()
+                val fileSender = FileTransferSender(session)
+                sender = fileSender
+                _senderProgress.value = TransferProgress(
+                    phase = TransferPhase.Handshaking,
+                    fileName = fileName,
+                    message = "准备发送...",
+                )
+                _statusMessage.value = "正在发送: $fileName"
+                // Re-key the pending chat item to the real transfer id.
+                _chatMessages.value = _chatMessages.value.map { item ->
+                    if (item.id == pendingId) {
+                        (item as? ChatItem.File)?.copy(transferId = transferId) ?: item
+                    } else {
+                        item
                     }
-                    TransferPhase.Verifying -> _statusMessage.value = "正在校验..."
-                    TransferPhase.Completed -> _statusMessage.value = "发送完成: ${progress.fileName}"
-                    TransferPhase.Failed -> _statusMessage.value = progress.message.ifBlank {
-                        "发送失败"
+                }
+                val progressJob = launch {
+                    fileSender.progress.collect { progress ->
+                        _senderProgress.value = progress
+                        updateChatItem("file-$transferId") { item ->
+                            (item as? ChatItem.File)?.copy(
+                                phase = progress.phase,
+                                bytesSent = progress.bytesSent,
+                                bytesPerSecond = progress.bytesPerSecond,
+                                message = progress.message,
+                            ) ?: item
+                        }
+                        when (progress.phase) {
+                            TransferPhase.Handshaking,
+                            TransferPhase.Transferring,
+                            -> _statusMessage.value = progress.message.ifBlank {
+                                "正在发送: ${progress.fileName}"
+                            }
+                            TransferPhase.Verifying -> _statusMessage.value = "正在校验..."
+                            TransferPhase.Completed -> _statusMessage.value = "发送完成: ${progress.fileName}"
+                            TransferPhase.Failed -> _statusMessage.value = progress.message.ifBlank {
+                                "发送失败"
+                            }
+                            TransferPhase.Idle -> Unit
+                        }
                     }
-                    TransferPhase.Idle -> Unit
+                }
+                runCatching {
+                    openSource().use { source ->
+                        fileSender.send(fileName, mimeType, transferId, source)
+                    }
+                }.onFailure { error ->
+                    _statusMessage.value = "发送失败: ${error.message ?: "未知错误"}"
+                }
+                progressJob.cancel()
+            }.onFailure { error ->
+                _statusMessage.value = "发送失败: ${error.message ?: "未知错误"}"
+                updateChatItem(pendingId) { item ->
+                    (item as? ChatItem.File)?.copy(
+                        phase = TransferPhase.Failed,
+                        message = error.message ?: "未知错误",
+                    ) ?: item
                 }
             }
-        }
-        openSource().use { source ->
-            fileSender.send(fileName, mimeType, transferId, source)
         }
     }
 
@@ -306,7 +355,20 @@ class TransferSessionManager(
     private fun bindPeerHandlers() {
         val session = coordinator?.activeSession
             ?: error("WebRTC 会话未建立，无法绑定对等端")
+        var receiveTransferId: String? = null
         val fileReceiver = FileTransferReceiver(session, scope) { manifest ->
+            receiveTransferId = manifest.transferId
+            appendChatItem(
+                ChatItem.File(
+                    transferId = manifest.transferId,
+                    fileName = manifest.fileName,
+                    sizeBytes = manifest.sizeBytes,
+                    isMine = false,
+                    timestamp = Clock.System.now().toEpochMilliseconds(),
+                    phase = TransferPhase.Handshaking,
+                    message = "开始接收...",
+                ),
+            )
             createReceiveSink(manifest)
         }
         receiver = fileReceiver
@@ -314,15 +376,8 @@ class TransferSessionManager(
         transferJobs += scope.launch {
             session.incomingMessages.collect { message ->
                 when (message) {
-                    is DataChannelMessage.ChunkAck -> Unit
                     is DataChannelMessage.Text -> {
                         if (handleIncomingChat(message.text, localDeviceId)) return@collect
-                        runCatching {
-                            chatJson.decodeFromString(BlockRequest.serializer(), message.text)
-                        }.onSuccess { request ->
-                            sender?.onBlockRequest(request)
-                            return@collect
-                        }
                         runCatching { fileReceiver.handleText(message.text) }
                             .onFailure { error ->
                                 _statusMessage.value = "接收失败: ${error.message ?: "未知错误"}"
@@ -340,6 +395,16 @@ class TransferSessionManager(
         transferJobs += scope.launch {
             fileReceiver.progress.collect { progress ->
                 _receiverProgress.value = progress
+                receiveTransferId?.let { id ->
+                    updateChatItem("file-$id") { item ->
+                        (item as? ChatItem.File)?.copy(
+                            phase = progress.phase,
+                            bytesSent = progress.bytesSent,
+                            bytesPerSecond = progress.bytesPerSecond,
+                            message = progress.message,
+                        ) ?: item
+                    }
+                }
                 when (progress.phase) {
                     TransferPhase.Handshaking,
                     TransferPhase.Transferring,
@@ -430,6 +495,7 @@ class TransferSessionManager(
 
     private suspend fun establishWebRtc(role: SignalingRole) {
         if (coordinator != null) return
+        requireWebRtcAvailable()
         signaling.waitUntilConnected()
         _statusMessage.value = "获取 ICE 服务器..."
         val ice = resolveIceServers()
@@ -541,11 +607,15 @@ class TransferSessionManager(
         }.getOrNull() ?: return false
         if (payload.type != "chat") return false
         if (!seenChatIds.add(payload.messageId)) return true
-        appendChatLine(payload.toChatLine(localDeviceId))
+        appendChatItem(payload.toChatItemText(localDeviceId))
         return true
     }
 
-    private fun appendChatLine(line: ChatLine) {
-        _chatMessages.value = _chatMessages.value + line
+    private fun appendChatItem(item: ChatItem) {
+        _chatMessages.value = _chatMessages.value + item
+    }
+
+    private fun updateChatItem(id: String, transform: (ChatItem) -> ChatItem) {
+        _chatMessages.value = _chatMessages.value.map { if (it.id == id) transform(it) else it }
     }
 }
